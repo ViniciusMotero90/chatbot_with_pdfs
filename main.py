@@ -1,8 +1,10 @@
 import streamlit as st
+import uuid
 from dotenv import load_dotenv
 from PyPDF2 import PdfReader
 from langchain_text_splitters import CharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+import warnings
 from langchain_community.vectorstores import FAISS
 from langchain_community.chat_message_histories import ChatMessageHistory
 from langchain_core.chat_history import BaseChatMessageHistory
@@ -11,6 +13,10 @@ from langchain_core.runnables import RunnablePassthrough
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.output_parsers import StrOutputParser
 from htmlTemplate import css, bot_template, user_template
+from langgraph.graph import StateGraph, START, MessagesState
+from langgraph.checkpoint.memory import MemorySaver
+
+warnings.filterwarnings("ignore", category=DeprecationWarning, module="langchain_community")
 
 def get_pdf_text(pdf_docs):
     txt = ""
@@ -41,67 +47,30 @@ def format_docs(docs):
 def get_conversation_chain(vectorstore):
     llm = ChatOpenAI()
     retriever = vectorstore.as_retriever()
-
-    # Prompt para reformular a pergunta com base no histórico
-    contextualize_prompt = ChatPromptTemplate.from_messages([
-        ("system", "Dado o histórico da conversa e a pergunta do usuário, reformule a "
-                   "pergunta para que seja autossuficiente. Não responda, apenas "
-                   "reformule (ou retorne igual, se já estiver clara)."),
-        MessagesPlaceholder("chat_history"),
-        ("human", "{input}"),
-    ])
-    contextualize_chain = contextualize_prompt | llm | StrOutputParser()
-
-    def route(input_dict):
-        if input_dict.get("chat_history"):
-            return contextualize_chain
-        return input_dict["input"]
-
-    history_aware_retriever = (
-        RunnablePassthrough.assign(standalone_question=route)
-        | (lambda x: retriever.invoke(x["standalone_question"]))
-    )
-
-    qa_prompt = ChatPromptTemplate.from_messages([
-        ("system", "Você é um assistente que responde perguntas sobre os documentos "
-                   "do usuário. Use o contexto abaixo para responder. Se não souber, "
-                   "diga que não sabe.\n\n{context}"),
-        MessagesPlaceholder("chat_history"),
-        ("human", "{input}"),
-    ])
-
-    rag_chain = (
-        RunnablePassthrough.assign(context=history_aware_retriever | format_docs)
-        | qa_prompt
-        | llm
-        | StrOutputParser()
-    )
-
-    # Memória em sessão (armazenada no session_state pra persistir entre reruns do Streamlit)
-    if "store" not in st.session_state:
-        st.session_state.store = {}
-
-    def get_session_history(session_id: str) -> BaseChatMessageHistory:
-        if session_id not in st.session_state.store:
-            st.session_state.store[session_id] = ChatMessageHistory()
-        return st.session_state.store[session_id]
-
-    conversation_chain = RunnableWithMessageHistory(
-        rag_chain,
-        get_session_history,
-        input_messages_key="input",
-        history_messages_key="chat_history",
-    )
-    return conversation_chain
+    
+    def call_model(state: MessagesState):
+        print("DEBUG state recebido:", state)
+        question = state["messages"][-1].content
+        docs = retriever.invoke(question)
+        context = "\n\n".join(d.page_content for d in docs)
+        
+        prompt = f"Use o contexto abaixo para responder. \n\nContexto:\n{context}\n\nPergunta:{question}"
+        response = llm.invoke([{"role":"user","content":prompt}])
+        return {"messages": [response]}
+    workflow = StateGraph(MessagesState)
+    workflow.add_node("model",call_model)
+    workflow.add_edge(START,"model")
+    memory = MemorySaver()
+    return workflow.compile(checkpointer=memory)
 
 def handle_userinput(user_question):
+    config = {"configurable": {"thread_id": st.session_state.session_id}}
     response = st.session_state.conversation.invoke(
-        {"input": user_question},
-        config={"configurable": {"session_id": "default"}},
+        {"messages": [{"role": "user", "content": user_question}]},
+        config=config,
     )
-    history = st.session_state.store["default"].messages
-    for i, message in enumerate(history):
-        if i % 2 == 0:
+    for i, message in enumerate(response["messages"]):
+        if message.type == "human":
             st.write(user_template.replace("{{MSG}}", message.content), unsafe_allow_html=True)
         else:
             st.write(bot_template.replace("{{MSG}}", message.content), unsafe_allow_html=True)
@@ -115,6 +84,8 @@ def main():
         st.session_state.conversation = None
     if "chat_history" not in st.session_state:
         st.session_state.chat_history = None
+    if "session_id" not in st.session_state:
+        st.session_state.session_id = str(uuid.uuid4())
 
     st.header("Chat with multiple PDFs :books:")
     user_question = st.text_input("Ask a question about your documents:")
